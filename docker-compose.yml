@@ -27,6 +27,8 @@ services:
     # Do not expose ports directly when load balancing
     expose:
       - "3003"
+    ports:
+      - "3004:3003"
     volumes:
       - ./.docker-data/data:/data
       - ./.docker-data/opt/windsurf:/opt/windsurf

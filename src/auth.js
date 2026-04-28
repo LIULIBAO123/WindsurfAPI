@@ -233,6 +233,77 @@ async function registerWithCodeium(idToken) {
   return result; // { apiKey, name, apiServerUrl }
 }
 
+/**
+ * Register via Auth1 token (auth1_...) flow:
+ *   auth1Token → PostAuth → sessionToken
+ *   sessionToken → GetOneTimeAuthToken → oneTimeToken
+ *   oneTimeToken → RegisterUser → apiKey
+ */
+async function registerViaAuth1(auth1Token) {
+  const https = await import('https');
+
+  function jsonPost(url, body) {
+    return new Promise((resolve, reject) => {
+      const data = JSON.stringify(body);
+      const parsed = new URL(url);
+      const req = https.request({
+        hostname: parsed.hostname,
+        port: 443,
+        path: parsed.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          'Connect-Protocol-Version': '1',
+          'Origin': 'https://windsurf.com',
+          'Referer': 'https://windsurf.com/',
+        },
+      }, (res) => {
+        let raw = '';
+        res.on('data', d => raw += d);
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode, data: JSON.parse(raw) });
+          } catch {
+            reject(new Error(`Parse error: ${raw.slice(0, 200)}`));
+          }
+        });
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    });
+  }
+
+  const BASE = 'https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService';
+
+  // Step 1: auth1Token → sessionToken
+  log.info(`Auth1 PostAuth: token=${auth1Token.slice(0, 16)}...`);
+  const postAuth = await jsonPost(`${BASE}/WindsurfPostAuth`, {
+    auth1Token, orgId: '',
+  });
+  if (postAuth.status >= 400 || !postAuth.data?.sessionToken) {
+    throw new Error(`Auth1 PostAuth failed (${postAuth.status}): ${JSON.stringify(postAuth.data).slice(0, 200)}`);
+  }
+  const sessionToken = postAuth.data.sessionToken;
+  log.info(`Auth1 PostAuth OK, account=${postAuth.data.accountId || 'unknown'}`);
+
+  // Step 2: sessionToken → oneTimeAuthToken
+  const ott = await jsonPost(`${BASE}/GetOneTimeAuthToken`, {
+    authToken: sessionToken,
+  });
+  if (ott.status >= 400 || !ott.data?.authToken) {
+    throw new Error(`GetOneTimeAuthToken failed (${ott.status}): ${JSON.stringify(ott.data).slice(0, 200)}`);
+  }
+  log.info('Auth1 OneTimeToken OK');
+
+  // Step 3: oneTimeToken → Codeium RegisterUser
+  const reg = await registerWithCodeium(ott.data.authToken);
+  log.info(`Auth1 RegisterUser OK: key=${reg.apiKey.slice(0, 16)}...`);
+  return reg;
+}
+
 // ─── Account management ───────────────────────────────────
 
 /**
@@ -269,9 +340,15 @@ export function addAccountByKey(apiKey, label = '') {
 
 /**
  * Add account via auth token.
+ * Supports both Firebase ID tokens and Auth1 tokens (auth1_...).
  */
 export async function addAccountByToken(token, label = '') {
-  const reg = await registerWithCodeium(token);
+  let reg;
+  if (token.startsWith('auth1_')) {
+    reg = await registerViaAuth1(token);
+  } else {
+    reg = await registerWithCodeium(token);
+  }
   const existing = accounts.find(a => a.apiKey === reg.apiKey);
   if (existing) return existing;
 

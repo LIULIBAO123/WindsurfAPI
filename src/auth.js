@@ -242,9 +242,26 @@ async function registerWithCodeium(idToken) {
 async function registerViaAuth1(auth1Token) {
   const https = await import('https');
 
-  function jsonPost(url, body) {
+  // Protobuf minimal encoder for string fields
+  function encodeVarint(value) {
+    const bytes = [];
+    while (value >= 0x80) {
+      bytes.push((value & 0x7F) | 0x80);
+      value >>>= 7;
+    }
+    bytes.push(value);
+    return Buffer.from(bytes);
+  }
+
+  function protoStringField(fieldNum, str) {
+    const strBuf = Buffer.from(str, 'utf-8');
+    const tag = Buffer.from([(fieldNum << 3) | 2]);
+    const len = encodeVarint(strBuf.length);
+    return Buffer.concat([tag, len, strBuf]);
+  }
+
+  function protoRequest(url, body) {
     return new Promise((resolve, reject) => {
-      const data = JSON.stringify(body);
       const parsed = new URL(url);
       const req = https.request({
         hostname: parsed.hostname,
@@ -252,54 +269,103 @@ async function registerViaAuth1(auth1Token) {
         path: parsed.pathname,
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(data),
-          'Connect-Protocol-Version': '1',
-          'Origin': 'https://windsurf.com',
-          'Referer': 'https://windsurf.com/',
+          'accept': '*/*',
+          'content-type': 'application/proto',
+          'connect-protocol-version': '1',
+          'content-length': body.length,
+          'origin': 'https://windsurf.com',
+          'referer': 'https://windsurf.com/account/login',
         },
       }, (res) => {
-        let raw = '';
-        res.on('data', d => raw += d);
+        const chunks = [];
+        res.on('data', d => chunks.push(d));
         res.on('end', () => {
-          try {
-            resolve({ status: res.statusCode, data: JSON.parse(raw) });
-          } catch {
-            reject(new Error(`Parse error: ${raw.slice(0, 200)}`));
-          }
+          const buf = Buffer.concat(chunks);
+          resolve({ status: res.statusCode, data: buf });
         });
         res.on('error', reject);
       });
       req.on('error', reject);
-      req.write(data);
+      req.write(body);
       req.end();
     });
   }
 
-  const BASE = 'https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService';
-
-  // Step 1: auth1Token → sessionToken
-  log.info(`Auth1 PostAuth: token=${auth1Token.slice(0, 16)}...`);
-  const postAuth = await jsonPost(`${BASE}/WindsurfPostAuth`, {
-    auth1Token, orgId: '',
-  });
-  if (postAuth.status >= 400 || !postAuth.data?.sessionToken) {
-    throw new Error(`Auth1 PostAuth failed (${postAuth.status}): ${JSON.stringify(postAuth.data).slice(0, 200)}`);
+  // Parse protobuf string field from response buffer
+  function parseProtoStrings(buf) {
+    // Skip 5-byte gRPC-Web envelope if present
+    let data = buf;
+    if (buf.length > 5) {
+      const declared = buf.readUInt32BE(1);
+      if ((buf[0] & 0x7e) === 0 && declared > 0 && declared + 5 === buf.length) {
+        data = buf.slice(5);
+      }
+    }
+    const fields = {};
+    let i = 0;
+    while (i < data.length) {
+      const tag = data[i]; i++;
+      const fieldNum = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 2) { // length-delimited
+        let len = 0, shift = 0;
+        while (i < data.length) {
+          const b = data[i]; i++;
+          len |= (b & 0x7F) << shift;
+          shift += 7;
+          if ((b & 0x80) === 0) break;
+        }
+        if (i + len <= data.length) {
+          fields[fieldNum] = data.slice(i, i + len).toString('utf-8');
+        }
+        i += len;
+      } else if (wireType === 0) { // varint
+        while (i < data.length && (data[i] & 0x80)) i++;
+        i++;
+      } else {
+        break;
+      }
+    }
+    return fields;
   }
-  const sessionToken = postAuth.data.sessionToken;
-  log.info(`Auth1 PostAuth OK, account=${postAuth.data.accountId || 'unknown'}`);
 
-  // Step 2: sessionToken → oneTimeAuthToken
-  const ott = await jsonPost(`${BASE}/GetOneTimeAuthToken`, {
-    authToken: sessionToken,
-  });
-  if (ott.status >= 400 || !ott.data?.authToken) {
-    throw new Error(`GetOneTimeAuthToken failed (${ott.status}): ${JSON.stringify(ott.data).slice(0, 200)}`);
+  const BASE = 'https://web-backend.windsurf.com/exa.seat_management_pb.SeatManagementService';
+
+  // Step 1: auth1Token → sessionToken (Protobuf)
+  log.info(`Auth1 PostAuth: token=${auth1Token.slice(0, 16)}...`);
+  const postAuthBody = Buffer.concat([
+    protoStringField(1, auth1Token),
+    protoStringField(2, ''),  // orgId empty
+  ]);
+  const postAuth = await protoRequest(`${BASE}/WindsurfPostAuth`, postAuthBody);
+  if (postAuth.status >= 400) {
+    const errText = postAuth.data.toString('utf-8');
+    throw new Error(`Auth1 PostAuth failed (${postAuth.status}): ${errText.slice(0, 200)}`);
+  }
+  const postAuthFields = parseProtoStrings(postAuth.data);
+  // field 1 = sessionToken
+  const sessionToken = postAuthFields[1];
+  if (!sessionToken) {
+    throw new Error(`Auth1 PostAuth: no sessionToken in response`);
+  }
+  log.info(`Auth1 PostAuth OK`);
+
+  // Step 2: sessionToken → oneTimeAuthToken (Protobuf)
+  const ottBody = protoStringField(1, sessionToken);
+  const ott = await protoRequest(`${BASE}/GetOneTimeAuthToken`, ottBody);
+  if (ott.status >= 400) {
+    const errText = ott.data.toString('utf-8');
+    throw new Error(`GetOneTimeAuthToken failed (${ott.status}): ${errText.slice(0, 200)}`);
+  }
+  const ottFields = parseProtoStrings(ott.data);
+  const oneTimeToken = ottFields[1];
+  if (!oneTimeToken) {
+    throw new Error(`GetOneTimeAuthToken: no token in response`);
   }
   log.info('Auth1 OneTimeToken OK');
 
   // Step 3: oneTimeToken → Codeium RegisterUser
-  const reg = await registerWithCodeium(ott.data.authToken);
+  const reg = await registerWithCodeium(oneTimeToken);
   log.info(`Auth1 RegisterUser OK: key=${reg.apiKey.slice(0, 16)}...`);
   return reg;
 }

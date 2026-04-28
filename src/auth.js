@@ -344,7 +344,7 @@ export function addAccountByKey(apiKey, label = '') {
  */
 export async function addAccountByToken(token, label = '') {
   let reg;
-  if (token.startsWith('auth1_')) {
+  if (token.startsWith('auth1_') || token.startsWith('auth_')) {
     reg = await registerViaAuth1(token);
   } else {
     reg = await registerWithCodeium(token);
